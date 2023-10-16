@@ -5,7 +5,7 @@ This is the code for the AirGradient DIY PRO Air Quality Sensor with an ESP8266 
 
 It is a high quality sensor showing PM2.5, CO2, Temperature and Humidity on a small display and can send data over Wifi.
 
-Build Instructions: https://www.airgradient.com/open-airgradient/instructions/diy-pro-v42/
+Build Instructions: https://www.airgradient.com/open-airgradient/instructions/diy-pro-v37/
 
 Kits (including a pre-soldered version) are available: https://www.airgradient.com/open-airgradient/kits/
 
@@ -30,10 +30,11 @@ CC BY-SA 4.0 Attribution-ShareAlike 4.0 International License
 
 
 #include <AirGradient.h>
-#include <WiFiManager.h>
-#include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
+#include <ESP8266WebServer.h>
+#include <ESP8266WiFi.h>
 #include <WiFiClient.h>
+#include <WiFiManager.h>
 
 #include <EEPROM.h>
 #include "SHTSensor.h"
@@ -43,7 +44,7 @@ CC BY-SA 4.0 Attribution-ShareAlike 4.0 International License
 #include <NOxGasIndexAlgorithm.h>
 #include <VOCGasIndexAlgorithm.h>
 
-
+#include <SparkLine.h>
 #include <U8g2lib.h>
 
 AirGradient ag = AirGradient();
@@ -52,74 +53,182 @@ VOCGasIndexAlgorithm voc_algorithm;
 NOxGasIndexAlgorithm nox_algorithm;
 SHTSensor sht;
 
-// time in seconds needed for NOx conditioning
-uint16_t conditioning_s = 10;
-
-// for peristent saving and loading
-int addr = 4;
-byte value;
-
 // Display bottom right
-U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/U8X8_PIN_NONE);
 
 // Replace above if you have display on top left
 //U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R2, /* reset=*/ U8X8_PIN_NONE);
 
-
 // CONFIGURATION START
+// for persistent saving and loading
+const uint8_t settings_addr = 4;
+const uint8_t hostname_addr = 8;
+const uint8_t hostname_len = 24;
+const uint8_t sparkInterval_addr = 32;
 
 //set to the endpoint you would like to use
+boolean useAGPlatform = false;
 String APIROOT = "http://hw.airgradient.com/";
 
 // set to true to switch from Celcius to Fahrenheit
-boolean inF = false;
+boolean useFahrenheit = true;
 
 // PM2.5 in US AQI (default ug/m3)
-boolean inUSAQI = false;
+boolean useUSAQI = true;
 
-// Display Position
-boolean displayTop = true;
+// interval to record measurements to spark
+uint8_t sparkInterval = 1;
 
 // set to true if you want to connect to wifi. You have 60 seconds to connect. Then it will go into an offline mode.
-boolean connectWIFI=true;
+char hostname[24];
 
 // CONFIGURATION END
 
+const std::function<float(const uint16_t x)> identity = [](const uint16_t val) { return static_cast<float>(val); };
+const std::function<float(const uint16_t x)> K_TO_C = [](uint16_t kelvin_hundredths) {
+  return (kelvin_hundredths / 100.0) - 273.15;
+};
+const std::function<float(const uint16_t x)> K_TO_F = [](uint16_t kelvin_hundredths) {
+  return (K_TO_C(kelvin_hundredths) * 9. / 5. + 32.);
+};
 
-unsigned long currentMillis = 0;
+// Calculate PM2.5 US AQI
+const std::function<float(const uint16_t x)> PM_TO_AQI_US = [](const uint16_t pm02) {
+  if (pm02 <= 12.0) return ((50 - 0) / (12.0 - .0) * (pm02 - .0) + 0);
+  else if (pm02 <= 35.4) return ((100 - 50) / (35.4 - 12.0) * (pm02 - 12.0) + 50);
+  else if (pm02 <= 55.4) return ((150 - 100) / (55.4 - 35.4) * (pm02 - 35.4) + 100);
+  else if (pm02 <= 150.4) return ((200 - 150) / (150.4 - 55.4) * (pm02 - 55.4) + 150);
+  else if (pm02 <= 250.4) return ((300 - 200) / (250.4 - 150.4) * (pm02 - 150.4) + 200);
+  else if (pm02 <= 350.4) return ((400 - 300) / (350.4 - 250.4) * (pm02 - 250.4) + 300);
+  else if (pm02 <= 500.4) return ((500 - 400) / (500.4 - 350.4) * (pm02 - 350.4) + 400);
+  else return 500.;
+};
 
-const int oledInterval = 5000;
-unsigned long previousOled = 0;
+class AirVariable 
+{
+  using UnitConversionFunction = std::function<float(const uint16_t x)>;
+  SparkLine<uint16_t> spark;
+  uint16_t last = 0;
+  String label;
+  String units;
+  UnitConversionFunction conversion;
 
-const int sendToServerInterval = 10000;
-unsigned long previoussendToServer = 0;
+  private:
+    void formatNumber(char* s, size_t n, float x) const {
+      uint16_t asint = static_cast<uint16_t>(x);
+      if (asint == x) {
+        snprintf(s, n, "%d", asint);
+      } else {
+        snprintf(s, n, "%.1f", x);
+      }
+    }
+  
+  public:
+    void update(uint16_t measurement, boolean recordToSpark) {
+      last = measurement;
+      if (recordToSpark) {
+        spark.add(measurement);
+      }
+    }
 
-const int tvocInterval = 1000;
-unsigned long previousTVOC = 0;
-int TVOC = 0;
-int NOX = 0;
+    uint16_t getLast() const {
+      return last;
+    }
 
-const int co2Interval = 5000;
-unsigned long previousCo2 = 0;
-int Co2 = 0;
+    void setConversion(UnitConversionFunction newVal) {
+      conversion = newVal;
+    }
 
-const int pmInterval = 5000;
-unsigned long previousPm = 0;
-int pm25 = 0;
-int pm01 = 0;
-int pm10 = 0;
-int pm03PCount = 0;
+    void setUnits(String newVal) {
+      units = newVal;
+    }
 
-const int tempHumInterval = 2500;
-unsigned long previousTempHum = 0;
-float temp = 0;
-int hum = 0;
+    void draw() const {
+      char number_buffer[6];
+      u8g2.setFont(u8g2_font_t0_18b_tf);
+      
+      formatNumber(number_buffer, 6, conversion(last));
+      u8g2_uint_t width = u8g2.drawStr(0, 31, number_buffer);
 
-int buttonConfig=0;
-int lastState = LOW;
-int currentState;
-unsigned long pressedTime  = 0;
-unsigned long releasedTime = 0;
+      u8g2.setFont(u8g2_font_t0_11_tf);
+      u8g2.drawStr(0, 11, label.c_str());
+      u8g2.drawStr(width, 31, units.c_str());
+
+      formatNumber(number_buffer, 6, conversion(spark.findMax()));
+      u8g2.drawStr(98, 24, number_buffer);
+
+      formatNumber(number_buffer, 6, conversion(spark.findMin()));
+      u8g2.drawStr(98, 36, number_buffer);
+
+      u8g2.setFont(u8g2_font_siji_t_6x10);
+      u8g2.drawGlyph(86, 24, 0xe12b);
+      u8g2.drawGlyph(86, 36, 0xe12c);
+
+      spark.draw(0, 50, 76, 16);
+    }
+
+    AirVariable(
+      const char* _label,
+      const char* _units,
+      UnitConversionFunction converter = identity
+    )
+      : spark(60, [&](const uint16_t x0, const uint16_t y0, const uint16_t x1, const uint16_t y1) { 
+          u8g2.drawLine(x0, y0, x1, y1);
+        }),
+        label(_label),
+        units(_units),
+        conversion(converter)
+    {}  
+};
+
+AirVariable TVOC("TVOC", "");
+AirVariable NOX("NOX", "");
+AirVariable CO2("CO\xB2", "ppm");
+AirVariable pm10("PM 10", "\xB5g/m\xB3");
+AirVariable pm25(
+  "PM 2.5", 
+  useUSAQI ? "AQI" : "\xB5g/m\xB3", 
+  useUSAQI ? PM_TO_AQI_US : identity
+);
+AirVariable pm01("PM 1", "\xB5g/m\xB3");
+AirVariable pm03("PM 0.03", "");
+AirVariable temp(
+  "TEMPERATURE", 
+  useFahrenheit ? "\xB0" "F" : "\xB0" "C", 
+  useFahrenheit ? K_TO_F : K_TO_C
+);
+AirVariable hum("HUMIDITY", "%");
+
+const AirVariable* const allVariables[] = {
+  &TVOC, 
+  &NOX, 
+  &CO2,
+  &pm10,
+  &pm25, 
+  &pm01,
+  &pm03,
+  &temp,
+  &hum 
+};
+
+// STATE
+
+// index in allVariables of displayed variable
+uint8_t displayVariable = 0;
+
+// wifi display state toggle
+boolean displaySSID = true;
+
+// current spark interval
+uint8_t currentInterval = 0;
+
+// time in seconds needed for NOx conditioning
+uint16_t conditioning_runs = 2;
+
+int lastState = HIGH;
+int buttonState = HIGH;
+unsigned long debounceStart = 0;
+const unsigned long debounceDelay = 50;
 
 void setup() {
   Serial.begin(115200);
@@ -132,30 +241,12 @@ void setup() {
   EEPROM.begin(512);
   delay(500);
 
-  buttonConfig = String(EEPROM.read(addr)).toInt();
-  if (buttonConfig>3) buttonConfig=0;
-  delay(400);
-  setConfig();
-  Serial.println("buttonConfig: "+String(buttonConfig));
-   updateOLED2("Press Button", "Now for", "Config Menu");
-    delay(2000);
+  readSettings();
+
   pinMode(D7, INPUT_PULLUP);
-  currentState = digitalRead(D7);
-  if (currentState == LOW)
-  {
-    updateOLED2("Entering", "Config Menu", "");
-    delay(3000);
-    lastState = HIGH;
-    setConfig();
-    inConf();
-  }
 
-  if (connectWIFI)
-  {
-     connectToWifi();
-  }
+  startWifi();
 
-  updateOLED2("Warming Up", "Serial Number:", String(ESP.getChipId(), HEX));
   sgp41.begin(Wire);
   ag.CO2_Init();
   ag.PMS_Init();
@@ -163,271 +254,321 @@ void setup() {
 }
 
 void loop() {
-  currentMillis = millis();
-  updateTVOC();
-  updateOLED();
-  updateCo2();
-  updatePm();
-  updateTempHum();
-  sendToServer();
+  static esp8266::polledTimeout::periodicMs fivSecond(5000);
+  static esp8266::polledTimeout::periodicMs tenSecond(10000);
+
+  if (fivSecond) {
+    updateTVOC();
+    updateTempHum();
+    updateCo2();
+    updatePm();
+
+    currentInterval = (currentInterval + 1) % (sparkInterval + 1);
+    displayVariable = (displayVariable + 1) % (sizeof(allVariables) / sizeof(allVariables[0]));
+  }
+  if (tenSecond) {
+    sendToServer();
+
+    displaySSID = !displaySSID;
+  }
+
+  wifiManager.process();
+  
+  int reading = digitalRead(D7);
+  if (reading != lastState) {
+    debounceStart = millis();
+  }
+  if ((millis() - debounceStart) > debounceDelay) {
+    if (reading != buttonState) {
+      buttonState = reading;
+
+      if (buttonState == LOW) {
+        // reset
+        WiFi.disconnect();
+        useAGPlatform = false;
+        useFahrenheit = true;
+        useUSAQI = true;
+        sparkInterval = 1;
+        strcpy(hostname, "");
+        writeSettings();
+        renderText("Resetting", "", "");
+        delay(1000);
+
+        ESP.reset();
+      }
+    }
+  }
+  lastState = reading;
+  
+  renderVariable();
 }
 
-void inConf(){
-  setConfig();
-  currentState = digitalRead(D7);
+void readSettings() {
+  uint8_t settings = EEPROM.read(settings_addr);
+  useAGPlatform = (settings & 1) == 1;
+  useFahrenheit = (settings & (1 << 1)) == 1;
+  useUSAQI = (settings & (1 << 2)) == 1;
 
-  if (currentState){
-    Serial.println("currentState: high");
+  for (unsigned long i = 0; i < hostname_len; i++) {
+    hostname[i] = EEPROM.read(hostname_addr + i);
+  }
+
+  temp.setConversion(useFahrenheit ? K_TO_F : K_TO_C);
+  temp.setUnits(useFahrenheit ? "\xB0" "F" : "\xB0" "C");
+  pm25.setConversion(useUSAQI ? PM_TO_AQI_US : identity);
+  pm25.setUnits(useUSAQI ? "AQI" : "\xB5g/m\xB3");
+  WiFi.setHostname(hostname);
+
+  sparkInterval = EEPROM.read(sparkInterval_addr);
+
+  validateSparkInterval();
+}
+
+void writeSettings() {
+  validateSparkInterval();
+
+  uint8_t settings = 0;
+  if (useAGPlatform) {
+    settings |= 1;
+  }
+  if (useFahrenheit) {
+    settings |= (1 << 1);
+  }
+  if (useUSAQI) {
+    settings |= (1 << 2);
+  }
+  EEPROM.write(settings_addr, settings);
+
+  for (unsigned long i = 0; i < hostname_len; i++) {
+    EEPROM.write(hostname_addr + i, hostname[i]);
+  }
+
+  EEPROM.write(sparkInterval_addr, sparkInterval);
+
+  EEPROM.commit();
+
+  temp.setConversion(useFahrenheit ? K_TO_F : K_TO_C);
+  temp.setUnits(useFahrenheit ? "\xB0" "F" : "\xB0" "C");
+  pm25.setConversion(useUSAQI ? PM_TO_AQI_US : identity);
+  pm25.setUnits(useUSAQI ? "AQI" : "\xB5g/m\xB3");
+  WiFi.setHostname(hostname);
+}
+
+void updateTVOC() {
+  uint16_t error;
+  uint16_t srawVoc = 0;
+  uint16_t srawNox = 0;
+
+  uint16_t temp_celsius = static_cast<uint16_t>(std::round(K_TO_C(temp.getLast())));
+  uint16_t compensationT = static_cast<uint16_t>((temp_celsius + 45) * 65535. / 175.);
+  uint16_t compensationRh = static_cast<uint16_t>(hum.getLast() * 65535. / 100.);
+
+  if (conditioning_runs > 0) {
+    error = sgp41.executeConditioning(
+      compensationRh, 
+      compensationT, 
+      srawVoc
+    );
+    conditioning_runs--;
   } else {
-    Serial.println("currentState: low");
+    error = sgp41.measureRawSignals(
+      compensationRh, 
+      compensationT, 
+      srawVoc,
+      srawNox
+    );
   }
 
-  if(lastState == HIGH && currentState == LOW) {
-    pressedTime = millis();
-  }
-
-  else if(lastState == LOW && currentState == HIGH) {
-    releasedTime = millis();
-    long pressDuration = releasedTime - pressedTime;
-    if( pressDuration < 1000 ) {
-      buttonConfig=buttonConfig+1;
-      if (buttonConfig>3) buttonConfig=0;
-    }
-  }
-
-  if (lastState == LOW && currentState == LOW){
-     long passedDuration = millis() - pressedTime;
-      if( passedDuration > 4000 ) {
-        // to do
-//        if (buttonConfig==4) {
-//          updateOLED2("Saved", "Release", "Button Now");
-//          delay(1000);
-//          updateOLED2("Starting", "CO2", "Calibration");
-//          delay(1000);
-//          Co2Calibration();
-//       } else {
-          updateOLED2("Saved", "Release", "Button Now");
-          delay(1000);
-          updateOLED2("Rebooting", "in", "5 seconds");
-          delay(5000);
-          EEPROM.write(addr, char(buttonConfig));
-          EEPROM.commit();
-          delay(1000);
-          ESP.restart();
- //       }
-    }
-
-  }
-  lastState = currentState;
-  delay(100);
-  inConf();
+  TVOC.update(voc_algorithm.process(srawVoc), currentInterval % sparkInterval == 0);
+  NOX.update(nox_algorithm.process(srawNox), currentInterval % sparkInterval == 0);
+  Serial.println("TVOC: " + String(TVOC.getLast()));
 }
 
-
-void setConfig() {
-  if (buttonConfig == 0) {
-    updateOLED2("Temp. in C", "PM in ug/m3", "Long Press Saves");
-      u8g2.setDisplayRotation(U8G2_R0);
-      inF = false;
-      inUSAQI = false;
-  }
-    if (buttonConfig == 1) {
-    updateOLED2("Temp. in C", "PM in US AQI", "Long Press Saves");
-      u8g2.setDisplayRotation(U8G2_R0);
-      inF = false;
-      inUSAQI = true;
-  } else if (buttonConfig == 2) {
-    updateOLED2("Temp. in F", "PM in ug/m3", "Long Press Saves");
-    u8g2.setDisplayRotation(U8G2_R0);
-      inF = true;
-      inUSAQI = false;
-  } else  if (buttonConfig == 3) {
-    updateOLED2("Temp. in F", "PM in US AQI", "Long Press Saves");
-      u8g2.setDisplayRotation(U8G2_R0);
-       inF = true;
-      inUSAQI = true;
-  }
-
-
-
-  // to do
-  // if (buttonConfig == 8) {
-  //  updateOLED2("CO2", "Manual", "Calibration");
-  // }
+void updateCo2() {
+  CO2.update(ag.getCO2_Raw(), currentInterval % sparkInterval == 0);
+  Serial.println("CO2: " + String(CO2.getLast()));
 }
 
-void updateTVOC()
-{
- uint16_t error;
-    char errorMessage[256];
-    uint16_t defaultRh = 0x8000;
-    uint16_t defaultT = 0x6666;
-    uint16_t srawVoc = 0;
-    uint16_t srawNox = 0;
-    uint16_t defaultCompenstaionRh = 0x8000;  // in ticks as defined by SGP41
-    uint16_t defaultCompenstaionT = 0x6666;   // in ticks as defined by SGP41
-    uint16_t compensationRh = 0;              // in ticks as defined by SGP41
-    uint16_t compensationT = 0;               // in ticks as defined by SGP41
-
-    delay(1000);
-
-    compensationT = static_cast<uint16_t>((temp + 45) * 65535 / 175);
-    compensationRh = static_cast<uint16_t>(hum * 65535 / 100);
-
-    if (conditioning_s > 0) {
-        error = sgp41.executeConditioning(compensationRh, compensationT, srawVoc);
-        conditioning_s--;
-    } else {
-        error = sgp41.measureRawSignals(compensationRh, compensationT, srawVoc,
-                                        srawNox);
-    }
-
-    if (currentMillis - previousTVOC >= tvocInterval) {
-      previousTVOC += tvocInterval;
-      TVOC = voc_algorithm.process(srawVoc);
-      NOX = nox_algorithm.process(srawNox);
-      Serial.println(String(TVOC));
-    }
+void updatePm() {
+  pm01.update(ag.getPM1_Raw(), currentInterval % sparkInterval == 0);
+  pm25.update(ag.getPM2_Raw(), currentInterval % sparkInterval == 0);
+  pm10.update(ag.getPM10_Raw(), currentInterval % sparkInterval == 0);
+  pm03.update(ag.getPM0_3Count(), currentInterval % sparkInterval == 0);
+  Serial.println("PM25: " + String(pm25.getLast()));
 }
 
-void updateCo2()
-{
-    if (currentMillis - previousCo2 >= co2Interval) {
-      previousCo2 += co2Interval;
-      Co2 = ag.getCO2_Raw();
-      Serial.println(String(Co2));
-    }
-}
-
-void updatePm()
-{
-    if (currentMillis - previousPm >= pmInterval) {
-      previousPm += pmInterval;
-      pm01 = ag.getPM1_Raw();
-      pm25 = ag.getPM2_Raw();
-      pm10 = ag.getPM10_Raw();
-      pm03PCount = ag.getPM0_3Count();
-      Serial.println(String(pm25));
-    }
-}
-
-void updateTempHum()
-{
-    if (currentMillis - previousTempHum >= tempHumInterval) {
-      previousTempHum += tempHumInterval;
-
-      if (sht.readSample()) {
-      Serial.print("SHT:\n");
-      Serial.print("  RH: ");
-      Serial.print(sht.getHumidity(), 2);
-      Serial.print("\n");
-      Serial.print("  T:  ");
-      Serial.print(sht.getTemperature(), 2);
-      Serial.print("\n");
-      temp = sht.getTemperature();
-      hum = sht.getHumidity();
+void updateTempHum() {
+  if (sht.readSample()) {
+    // temp is hundreths of a degree to avoid using floats
+    uint16_t kelvin = static_cast<uint16_t>(std::round(
+      (sht.getTemperature() + 273.15) * 100
+    ));
+    temp.update(kelvin, currentInterval % sparkInterval == 0);
+    Serial.println("TEMP: " + String(kelvin / 100));
+    hum.update(
+      static_cast<uint16_t>(sht.getHumidity()),
+      currentInterval % sparkInterval == 0
+    );
   } else {
-      Serial.print("Error in readSample()\n");
+    Serial.println("Error in readSample()");
   }
-      Serial.println(String(temp));
-    }
 }
 
-void updateOLED() {
-   if (currentMillis - previousOled >= oledInterval) {
-     previousOled += oledInterval;
-
-    String ln3;
-    String ln1;
-
-    if (inUSAQI) {
-      ln1 = "AQI:" + String(PM_TO_AQI_US(pm25)) +  " CO2:" + String(Co2);
-    } else {
-      ln1 = "PM:" + String(pm25) +  " CO2:" + String(Co2);
-    }
-
-     String ln2 = "TVOC:" + String(TVOC) + " NOX:" + String(NOX);
-
-      if (inF) {
-        ln3 = "F:" + String((temp* 9 / 5) + 32) + " H:" + String(hum)+"%";
-        } else {
-        ln3 = "C:" + String(temp) + " H:" + String(hum)+"%";
-       }
-     updateOLED2(ln1, ln2, ln3);
-   }
-}
-
-void updateOLED2(String ln1, String ln2, String ln3) {
-  char buf[9];
-  u8g2.firstPage();
+void renderVariable() {
+  const AirVariable* variable = allVariables[displayVariable];
   u8g2.firstPage();
   do {
-  u8g2.setFont(u8g2_font_t0_16_tf);
-  u8g2.drawStr(1, 10, String(ln1).c_str());
-  u8g2.drawStr(1, 30, String(ln2).c_str());
-  u8g2.drawStr(1, 50, String(ln3).c_str());
-    } while ( u8g2.nextPage() );
+    variable->draw();
+    renderWifi();
+    renderSparkCaption();
+  } while (u8g2.nextPage());
+}
+
+void validateSparkInterval() {
+  switch (sparkInterval) {
+    case 1:
+    case 2:
+    case 6:
+    case 12:
+    case 72:
+    case 144:
+    case 288:
+      return;
+    default:
+      sparkInterval = 1;
+  }
+}
+
+void renderSparkCaption() {
+  String sparkCaption;
+  switch (sparkInterval) {
+    case 1:
+      sparkCaption = "last 5m";
+    case 2: 
+      sparkCaption = "last 10m";
+    case 6:
+      sparkCaption = "last 30m";
+    case 12:
+      sparkCaption = "last 1h";
+    case 72:
+      sparkCaption = "last 6h";
+    case 144:
+      sparkCaption = "last 12h";
+    case 288:
+      sparkCaption = "last 1d";
+    default:
+      sparkInterval = 1;
+      sparkCaption = "last 5m";
+  }
+  u8g2.setFont(u8g2_font_t0_11_tf);
+  u8g2.drawStr(79, 50, sparkCaption.c_str());
+}
+
+void renderWifi() {
+  u8g2.setFont(u8g2_font_siji_t_6x10);
+  if (WiFi.status() != WL_CONNECTED) {
+    u8g2.drawGlyph(0, 64, 0xe217);
+
+    u8g2.setFont(u8g2_font_t0_11_tf);
+    u8g2.drawStr(12, 64, "DISCONNECTED");
+  } else {
+    u8g2.drawGlyph(0, 64, 0xe21a);
+
+    u8g2.setFont(u8g2_font_t0_11_tf);
+    if (displaySSID) {
+      u8g2.drawStr(12, 64, WiFi.SSID().substring(0, 19).c_str());
+    } else {
+      char sliced[20];
+      strncpy(sliced, hostname, 19);
+      u8g2.drawStr(12, 64, sliced);
+    }
+  }
+}
+
+void renderText(String ln1, String ln2, String ln3) {
+  u8g2.firstPage();
+  do {
+    u8g2.setFont(u8g2_font_t0_16_tf);
+    u8g2.drawStr(1, 10, String(ln1).c_str());
+    u8g2.drawStr(1, 30, String(ln2).c_str());
+    u8g2.drawStr(1, 50, String(ln3).c_str());
+  } while (u8g2.nextPage());
 }
 
 void sendToServer() {
-   if (currentMillis - previoussendToServer >= sendToServerInterval) {
-     previoussendToServer += sendToServerInterval;
-      String payload = "{\"wifi\":" + String(WiFi.RSSI())
-      + (Co2 < 0 ? "" : ", \"rco2\":" + String(Co2))
-      + (pm01 < 0 ? "" : ", \"pm01\":" + String(pm01))
-      + (pm25 < 0 ? "" : ", \"pm02\":" + String(pm25))
-      + (pm10 < 0 ? "" : ", \"pm10\":" + String(pm10))
-      + (pm03PCount < 0 ? "" : ", \"pm003_count\":" + String(pm03PCount))
-      + (TVOC < 0 ? "" : ", \"tvoc_index\":" + String(TVOC))
-      + (NOX < 0 ? "" : ", \"nox_index\":" + String(NOX))
-      + ", \"atmp\":" + String(temp)
-      + (hum < 0 ? "" : ", \"rhum\":" + String(hum))
-      + "}";
+  if (!useAGPlatform) { 
+    return;
+  }
 
-      if(WiFi.status()== WL_CONNECTED){
-        Serial.println(payload);
-        String POSTURL = APIROOT + "sensors/airgradient:" + String(ESP.getChipId(), HEX) + "/measures";
-        Serial.println(POSTURL);
-        WiFiClient client;
-        HTTPClient http;
-        http.begin(client, POSTURL);
-        http.addHeader("content-type", "application/json");
-        int httpCode = http.POST(payload);
-        String response = http.getString();
-        Serial.println(httpCode);
-        Serial.println(response);
-        http.end();
-      }
-      else {
-        Serial.println("WiFi Disconnected");
-      }
-   }
+  String payload = "{\"wifi\":" + String(WiFi.RSSI())
+                    + ", \"rco2\":" + String(CO2.getLast())
+                    + ", \"pm01\":" + String(pm01.getLast())
+                    + ", \"pm02\":" + String(pm25.getLast())
+                    + ", \"pm10\":" + String(pm10.getLast())
+                    + ", \"pm003_count\":" + String(pm03.getLast())
+                    + ", \"tvoc_index\":" + String(TVOC.getLast())
+                    + ", \"nox_index\":" + String(NOX.getLast())
+                    + ", \"atmp\":" + String(K_TO_C(temp.getLast()))
+                    + ", \"rhum\":" + String(hum.getLast())
+                    + "}";
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println(payload);
+    String POSTURL = APIROOT + "sensors/airgradient:" + String(ESP.getChipId(), HEX) + "/measures";
+    Serial.println(POSTURL);
+    WiFiClient client;
+    HTTPClient http;
+    http.begin(client, POSTURL);
+    http.addHeader("content-type", "application/json");
+    int httpCode = http.POST(payload);
+    String response = http.getString();
+    Serial.println(httpCode);
+    Serial.println(response);
+    http.end();
+  } else {
+    Serial.println("WiFi Disconnected");
+  }
 }
 
 // Wifi Manager
- void connectToWifi() {
-   WiFiManager wifiManager;
-   //WiFi.disconnect(); //to delete previous saved hotspot
-   String HOTSPOT = "AG-" + String(ESP.getChipId(), HEX);
-   updateOLED2("90s to connect", "to Wifi Hotspot", HOTSPOT);
-   wifiManager.setTimeout(90);
+const String ag_platform_yes = "yes";
+const String temp_units_fahrenheit = "fahrenheit";
+const String pm_units_usaqi = "USAQI";
 
-   if (!wifiManager.autoConnect((const char * ) HOTSPOT.c_str())) {
-     updateOLED2("booting into", "offline mode", "");
-     Serial.println("failed to connect and hit timeout");
-     delay(6000);
-   }
+WiFiManager wifiManager;
 
+boolean saveConfig = false;
+
+void toggleSaveFlag() {
+  saveConfig = true;
 }
 
-// Calculate PM2.5 US AQI
-int PM_TO_AQI_US(int pm02) {
-  if (pm02 <= 12.0) return ((50 - 0) / (12.0 - .0) * (pm02 - .0) + 0);
-  else if (pm02 <= 35.4) return ((100 - 50) / (35.4 - 12.0) * (pm02 - 12.0) + 50);
-  else if (pm02 <= 55.4) return ((150 - 100) / (55.4 - 35.4) * (pm02 - 35.4) + 100);
-  else if (pm02 <= 150.4) return ((200 - 150) / (150.4 - 55.4) * (pm02 - 55.4) + 150);
-  else if (pm02 <= 250.4) return ((300 - 200) / (250.4 - 150.4) * (pm02 - 150.4) + 200);
-  else if (pm02 <= 350.4) return ((400 - 300) / (350.4 - 250.4) * (pm02 - 250.4) + 300);
-  else if (pm02 <= 500.4) return ((500 - 400) / (500.4 - 350.4) * (pm02 - 350.4) + 400);
-  else return 500;
-};
+void startWifi() {
+  wifiManager.setTimeout(90);
+  wifiManager.setConfigPortalBlocking(false);
+  wifiManager.setSaveConfigCallback(toggleSaveFlag);
+  String HOTSPOT = "AG-" + String(ESP.getChipId(), HEX);
+  renderText("90s to connect", "to Wifi Hotspot", HOTSPOT);
+  if (String(hostname).isEmpty()) {
+    strncpy(hostname, HOTSPOT.c_str(), 24);
+  }
+
+  if (!wifiManager.autoConnect((const char*)HOTSPOT.c_str())) {
+    Serial.println("Entering offline Mode");
+  }
+
+  if (saveConfig) {
+    strncpy(hostname, custom_hostname.getValue(), 24);
+    useAGPlatform = ag_platform_yes.equals(ag_platform.getValue());
+    useFahrenheit = temp_units_fahrenheit.equals(temp_units.getValue());
+    useUSAQI = pm_units_usaqi.equals(pm_units.getValue());
+    sparkInterval = String(spark_length.getValue()).toInt();
+    Serial.println("useAGPlatform: " + String(ag_platform.getValue()));
+    Serial.println("useFahrenheit: " + String(temp_units.getValue()));
+    Serial.println("useUSAQI: " + String(pm_units.getValue()));
+    Serial.println("sparkInterval: " + String(spark_length.getValue()));
+    validateSparkInterval();
+    writeSettings();
+    saveConfig = false;
+  }
+}
