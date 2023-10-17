@@ -131,6 +131,10 @@ class AirVariable
       }
     }
 
+    String getLabel() const {
+      return label;
+    }
+
     uint16_t getLast() const {
       return last;
     }
@@ -181,16 +185,17 @@ class AirVariable
     {}  
 };
 
+const char* cubic_microgram_unit = "\xB5g/m\xB3";
 AirVariable TVOC("TVOC", "");
 AirVariable NOX("NOX", "");
 AirVariable CO2("CO\xB2", "ppm");
-AirVariable pm10("PM 10", "\xB5g/m\xB3");
+AirVariable pm10("PM 10", cubic_microgram_unit);
 AirVariable pm25(
   "PM 2.5", 
-  useUSAQI ? "AQI" : "\xB5g/m\xB3", 
+  useUSAQI ? "AQI" : cubic_microgram_unit, 
   useUSAQI ? PM_TO_AQI_US : identity
 );
-AirVariable pm01("PM 1", "\xB5g/m\xB3");
+AirVariable pm01("PM 1", cubic_microgram_unit);
 AirVariable pm03("PM 0.03", "");
 AirVariable temp(
   "TEMPERATURE", 
@@ -230,6 +235,53 @@ int buttonState = HIGH;
 unsigned long debounceStart = 0;
 const unsigned long debounceDelay = 50;
 
+// Wifi Manager
+const String ag_platform_yes = "yes";
+const String temp_units_fahrenheit = "fahrenheit";
+const String pm_units_usaqi = "USAQI";
+
+#define HTML_LABEL(id, label) "<label for=\"" id "\">" label "</label>"
+#define HTML_SELECT_START(id, name) "<select id=\"" id "\" name=\"" name "\">"
+#define HTML_DEFAULT_OPTION(value, text) "<option value=\"" + value + "\" selected>" + text + "</option>"
+#define HTML_OPTION(value, text) "<option value=\"" + value + "\">" + text + "</option>"
+#define HTML_SELECT_END "</select>"
+
+WiFiManager wifiManager;
+WiFiManagerParameter wifi_hostname("hostname", "Hostname", "hostname", 23);
+WiFiManagerParameter wifi_ag_platform(
+  (HTML_LABEL("ag_platform", "AirGradient Platform")
+  HTML_SELECT_START("ag_platform", "ag_platform")
+    HTML_DEFAULT_OPTION(ag_platform_yes, "Yes")
+    HTML_OPTION("no", "No")
+  HTML_SELECT_END).c_str()
+);
+WiFiManagerParameter wifi_temp_units(
+  (HTML_LABEL("temp_units", "Temperature Units")
+  HTML_SELECT_START("temp_units", "temp_units")
+    HTML_DEFAULT_OPTION(temp_units_fahrenheit, "Fahrenheit")
+    HTML_OPTION("celsius", "Celsius")
+  HTML_SELECT_END).c_str()
+);
+WiFiManagerParameter wifi_pm_units(
+  (HTML_LABEL("pm_units", "PM 2.5 Units")
+  HTML_SELECT_START("pm_units", "pm_units")
+    HTML_DEFAULT_OPTION(pm_units_usaqi, "AQI")
+    HTML_OPTION("cubic_microgram", cubic_microgram_unit)
+  HTML_SELECT_END).c_str()
+);
+WiFiManagerParameter wifi_spark_interval(
+  (HTML_LABEL("spark_interval", "Chart Time Window")
+  HTML_SELECT_START("spark_interval", "spark_interval")
+    HTML_DEFAULT_OPTION(String("1"), String("5 min"))
+    HTML_OPTION("2", "10 min")
+    HTML_OPTION("6", "30 min")
+    HTML_OPTION("12", "1 hour")
+    HTML_OPTION("72", "6 hour")
+    HTML_OPTION("144", "12 hour")
+    HTML_OPTION("288", "1 day")
+  HTML_SELECT_END).c_str()
+);
+
 void setup() {
   Serial.begin(115200);
   Serial.println("Hello");
@@ -245,13 +297,78 @@ void setup() {
 
   pinMode(D7, INPUT_PULLUP);
 
-  startWifi();
+  setupWifi();
 
   sgp41.begin(Wire);
   ag.CO2_Init();
   ag.PMS_Init();
   ag.TMP_RH_Init(0x44);
 }
+
+void setupWifi() {
+  wifiManager.setTimeout(90);
+  wifiManager.setConfigPortalBlocking(false);
+
+  wifiManager.setSaveParamsCallback(wifi_saveParameters);
+  wifiManager.setSaveConfigCallback(wifi_startWebPortal);
+  wifiManager.setWebServerCallback(wifi_addRoutes);
+
+  wifiManager.addParameter(&wifi_ag_platform);
+  wifiManager.addParameter(&wifi_temp_units);
+  wifiManager.addParameter(&wifi_pm_units);
+  wifiManager.addParameter(&wifi_spark_interval);
+
+  String HOTSPOT = "AG-" + String(ESP.getChipId(), HEX);
+  
+  if (String(hostname).isEmpty()) {
+    strncpy(hostname, HOTSPOT.c_str(), 24);
+  }
+
+  if (wifiManager.autoConnect((const char*)HOTSPOT.c_str())) {
+    // if autoConnect succeeds the first time, it doesn't call the callback
+    wifi_startWebPortal();
+  }
+}
+
+void wifi_startWebPortal() {
+  wifiManager.startWebPortal();
+}
+
+void wifi_addRoutes() {
+  wifiManager.server->on("/metrics", wifi_handleMetrics);
+}
+
+#define JSON_FIELD(name, value) "\"" + name + "\": \"" + value + "\""
+void wifi_handleMetrics() {
+  // Use json-exporter if you want to ingest this to prometheus. Not worth being 
+  // prometheus-specific at this point.
+  String metrics = "{\n"
+    JSON_FIELD(String("id"), String(ESP.getChipId(), HEX))
+    JSON_FIELD(String("mac"), WiFi.macAddress())
+    JSON_FIELD(String("hostname"), String(hostname));
+
+  const uint8_t count = sizeof(allVariables) / sizeof(allVariables[0]);
+  for (uint i = 0; i < count; i++) {
+    if (i != 0) {
+      metrics += ",\n";
+    }
+    metrics += JSON_FIELD(allVariables[i]->getLabel(), String(allVariables[i]->getLast()));
+  }
+  metrics += "\n}";
+  wifiManager.server->send(200, "text/plain", metrics);
+}
+
+void wifi_saveParameters() {
+  strncpy(hostname, wifi_hostname.getValue(), 24);
+  useAGPlatform = ag_platform_yes.equals(wifi_ag_platform.getValue());
+  useFahrenheit = temp_units_fahrenheit.equals(wifi_temp_units.getValue());
+  useUSAQI = pm_units_usaqi.equals(wifi_pm_units.getValue());
+  sparkInterval = String(wifi_spark_interval.getValue()).toInt();
+  validateSparkInterval();
+
+  writeSettings();
+}
+
 
 void loop() {
   static esp8266::polledTimeout::periodicMs fivSecond(5000);
@@ -527,48 +644,5 @@ void sendToServer() {
     http.end();
   } else {
     Serial.println("WiFi Disconnected");
-  }
-}
-
-// Wifi Manager
-const String ag_platform_yes = "yes";
-const String temp_units_fahrenheit = "fahrenheit";
-const String pm_units_usaqi = "USAQI";
-
-WiFiManager wifiManager;
-
-boolean saveConfig = false;
-
-void toggleSaveFlag() {
-  saveConfig = true;
-}
-
-void startWifi() {
-  wifiManager.setTimeout(90);
-  wifiManager.setConfigPortalBlocking(false);
-  wifiManager.setSaveConfigCallback(toggleSaveFlag);
-  String HOTSPOT = "AG-" + String(ESP.getChipId(), HEX);
-  renderText("90s to connect", "to Wifi Hotspot", HOTSPOT);
-  if (String(hostname).isEmpty()) {
-    strncpy(hostname, HOTSPOT.c_str(), 24);
-  }
-
-  if (!wifiManager.autoConnect((const char*)HOTSPOT.c_str())) {
-    Serial.println("Entering offline Mode");
-  }
-
-  if (saveConfig) {
-    strncpy(hostname, custom_hostname.getValue(), 24);
-    useAGPlatform = ag_platform_yes.equals(ag_platform.getValue());
-    useFahrenheit = temp_units_fahrenheit.equals(temp_units.getValue());
-    useUSAQI = pm_units_usaqi.equals(pm_units.getValue());
-    sparkInterval = String(spark_length.getValue()).toInt();
-    Serial.println("useAGPlatform: " + String(ag_platform.getValue()));
-    Serial.println("useFahrenheit: " + String(temp_units.getValue()));
-    Serial.println("useUSAQI: " + String(pm_units.getValue()));
-    Serial.println("sparkInterval: " + String(spark_length.getValue()));
-    validateSparkInterval();
-    writeSettings();
-    saveConfig = false;
   }
 }
