@@ -30,16 +30,15 @@ CC BY-SA 4.0 Attribution-ShareAlike 4.0 International License
 
 #include <Arduino.h>
 #include <AirGradient.h>
+#include <EEPROM.h>
 #include <ESP8266HTTPClient.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266WiFi.h>
+#include <SoftwareSerial.h>
 #include <WiFiClient.h>
 #include <WiFiManager.h>
 
-#include <EEPROM.h>
 #include "SHTSensor.h"
-
-//#include "SGP30.h"
 #include <SensirionI2CSgp41.h>
 #include <NOxGasIndexAlgorithm.h>
 #include <VOCGasIndexAlgorithm.h>
@@ -47,7 +46,8 @@ CC BY-SA 4.0 Attribution-ShareAlike 4.0 International License
 #include <SparkLine.h>
 #include <U8g2lib.h>
 
-AirGradient ag = AirGradient();
+PMS pm;
+CO2Sensor co;
 SensirionI2CSgp41 sgp41;
 VOCGasIndexAlgorithm voc_algorithm;
 NOxGasIndexAlgorithm nox_algorithm;
@@ -79,7 +79,6 @@ boolean useUSAQI = true;
 // interval to record measurements to spark
 uint16_t sparkInterval = 1;
 
-// set to true if you want to connect to wifi. You have 60 seconds to connect. Then it will go into an offline mode.
 char hostname[24];
 
 // CONFIGURATION END
@@ -243,28 +242,14 @@ const String pm_units_usaqi = "USAQI";
 /** 
  * WiFiManagerParameter sucks if you want something other than a text input 
  * The only way to get it to use the entire customHTML is to null out getID
- * and if you do that, then value can never be set. So we have to override
- * the setValue method to set the value regardless of the getID.
- * 
- * The other shitty part is that the params handler in wifimanager writes 
- * directly to _value which is private. So we have to trick the base class
- * into initializing _value so that it's still possible to read and write to it.
- * 
- * Alright back to the drawing board. 
+ * and if you do that, then value can never be set.
  * 
  * init() always nulls out _value.
  * init() calls setValue().
  * setValue() is the only way to set _value.
  * setValue() only sets _value if _id is not null.
  * init() is the only way to set _id
- * I can't access _value or _id directly.
- * 
- * WifiManager directly writes to _value
- * WifiManager uses getID() to tell if it should just use CustomHTML
- * 
- * I don't think there's a way to do this without changing the base implementation.
  */
-const char* INTERNAL_ID = "_fake";
 class CustomParameter : public WiFiManagerParameter
 {
   public:
@@ -358,7 +343,6 @@ void readSettings() {
   wifiManager.setHostname(hostname);
 
   sparkInterval = EEPROM.read(sparkInterval_addr);
-  Serial.println("Read spark interval: " + String(sparkInterval));
 
   validateSparkInterval();
 }
@@ -382,7 +366,6 @@ void writeSettings() {
     EEPROM.write(hostname_addr + i, hostname[i]);
   }
 
-  Serial.println("Write spark interval: " + String(sparkInterval));
   EEPROM.write(sparkInterval_addr, sparkInterval);
   EEPROM.commit();
 
@@ -393,7 +376,7 @@ void writeSettings() {
   wifiManager.setHostname(hostname);
 }
 
-#define JSON_FIELD(name, value) "\"" + name + "\": \"" + value + "\""
+#define JSON_FIELD(name, value) "\"" + name + "\": \"" + value + "\",\n"
 void wifi_handleMetrics() {
   // Use json-exporter if you want to ingest this to prometheus. Not worth being 
   // prometheus-specific at this point.
@@ -410,7 +393,7 @@ void wifi_handleMetrics() {
     metrics += JSON_FIELD(allVariables[i]->getLabel(), String(allVariables[i]->getLast()));
   }
   metrics += "\n}";
-  wifiManager.server->send(200, "text/plain", metrics);
+  wifiManager.server->send(200, "application/json", metrics);
 }
 
 void wifi_addRoutes() {
@@ -431,10 +414,8 @@ void wifi_saveParameters() {
   useFahrenheit = temp_units_fahrenheit.equals(wifi_temp_units.getValue());
   useUSAQI = pm_units_usaqi.equals(wifi_pm_units.getValue());
   sparkInterval = String(wifi_spark_interval.getValue()).toInt();
-  Serial.println("Update spark interval: " + String(sparkInterval));
-  validateSparkInterval();
-  Serial.println("Validate spark interval: " + String(sparkInterval));
 
+  validateSparkInterval();
   writeSettings();
 }
 
@@ -499,15 +480,22 @@ void updateTVOC() {
 }
 
 void updateCo2() {
-  CO2.update(ag.getCO2_Raw(), currentInterval % sparkInterval == 0);
+  CO2.update(co.getCO2_Raw(), currentInterval % sparkInterval == 0);
   Serial.println("\nCO2: " + String(CO2.getLast()));
 }
 
 void updatePm() {
-  pm01.update(ag.getPM1_Raw(), currentInterval % sparkInterval == 0);
-  pm25.update(ag.getPM2_Raw(), currentInterval % sparkInterval == 0);
-  pm10.update(ag.getPM10_Raw(), currentInterval % sparkInterval == 0);
-  pm03.update(ag.getPM0_3Count(), currentInterval % sparkInterval == 0);
+  pm.requestRead();
+  if (!pm.readUntil(2000)) {
+    Serial.println("PM read failed");
+    return;
+  }
+
+  const PMS::Data& pm_data = pm.getData();
+  pm01.update(pm_data.PM_AE_UG_1_0, currentInterval % sparkInterval == 0);
+  pm25.update(pm_data.PM_AE_UG_2_5, currentInterval % sparkInterval == 0);
+  pm10.update(pm_data.PM_AE_UG_10_0, currentInterval % sparkInterval == 0);
+  pm03.update(pm_data.PM_RAW_0_3, currentInterval % sparkInterval == 0);
   Serial.println("PM25: " + String(pm25.getLast()));
 }
 
@@ -651,16 +639,22 @@ void setup() {
   sht.init();
   sht.setAccuracy(SHTSensor::SHT_ACCURACY_MEDIUM);
   sgp41.begin(Wire);
-  ag.CO2_Init();
-  ag.PMS_Init();
-  
+
+  SoftwareSerial pmSerial(D5, D6);
+  pmSerial.begin(9600);
+  pm.init(pmSerial);
+
+  SoftwareSerial coSerial(D4, D3);
+  coSerial.begin(9600);
+  co.init(coSerial);
 }
 
 void loop() {
+  static esp8266::polledTimeout::oneShot warmUp(10000);
   static esp8266::polledTimeout::periodicMs fivSecond(5000);
   static esp8266::polledTimeout::periodicMs tenSecond(10000);
 
-  if (fivSecond) {
+  if (fivSecond && warmUp) {
     updateTVOC();
     updateTempHum();
     updateCo2();
