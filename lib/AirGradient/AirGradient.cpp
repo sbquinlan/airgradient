@@ -186,6 +186,8 @@ CO2Sensor::CO2Sensor() {}
 
 void CO2Sensor::init(Stream &stream)
 {
+  _stream = &stream;
+
   if (getCO2_Raw() == -1)
   {
     Serial.println("CO2 Sensor Failed to Initialize ");

@@ -46,6 +46,9 @@ CC BY-SA 4.0 Attribution-ShareAlike 4.0 International License
 #include <SparkLine.h>
 #include <U8g2lib.h>
 
+SoftwareSerial pmSerial(D5, D6);
+SoftwareSerial coSerial(D4, D3);
+
 PMS pm;
 CO2Sensor co;
 SensirionI2CSgp41 sgp41;
@@ -226,9 +229,6 @@ boolean displaySSID = true;
 // current spark interval
 uint8_t currentInterval = 0;
 
-// time in seconds needed for NOx conditioning
-uint16_t conditioning_runs = 2;
-
 int lastState = HIGH;
 int buttonState = HIGH;
 unsigned long debounceStart = 0;
@@ -376,23 +376,58 @@ void writeSettings() {
   wifiManager.setHostname(hostname);
 }
 
-#define JSON_FIELD(name, value) "\"" + name + "\": \"" + value + "\",\n"
+void sendToServer() {
+  if (!useAGPlatform) { 
+    return;
+  }
+
+  String payload = "{\"wifi\":\"" + String(WiFi.RSSI())
+                    + "\", \"rco2\":\"" + String(CO2.getLast())
+                    + "\", \"pm01\":\"" + String(pm01.getLast())
+                    + "\", \"pm02\":\"" + String(pm25.getLast())
+                    + "\", \"pm10\":\"" + String(pm10.getLast())
+                    + "\", \"pm003_count\":\"" + String(pm03.getLast())
+                    + "\", \"tvoc_index\":\"" + String(TVOC.getLast())
+                    + "\", \"nox_index\":\"" + String(NOX.getLast())
+                    + "\", \"atmp\":\"" + String(K_TO_C(temp.getLast()))
+                    + "\", \"rhum\":\"" + String(hum.getLast())
+                    + "\"\n}";
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println(payload);
+    String POSTURL = APIROOT + "sensors/airgradient:" + String(ESP.getChipId(), HEX) + "/measures";
+    Serial.println(POSTURL);
+    WiFiClient client;
+    HTTPClient http;
+    http.begin(client, POSTURL);
+    http.addHeader("content-type", "application/json");
+    int httpCode = http.POST(payload);
+    String response = http.getString();
+    Serial.println(httpCode);
+    Serial.println(response);
+    http.end();
+  } else {
+    Serial.println("WiFi Disconnected");
+  }
+}
+
 void wifi_handleMetrics() {
   // Use json-exporter if you want to ingest this to prometheus. Not worth being 
   // prometheus-specific at this point.
   String metrics = "{\n"
-    JSON_FIELD(String("id"), String(ESP.getChipId(), HEX))
-    JSON_FIELD(String("mac"), WiFi.macAddress())
-    JSON_FIELD(String("hostname"), String(hostname));
-
-  const uint8_t count = sizeof(allVariables) / sizeof(allVariables[0]);
-  for (uint i = 0; i < count; i++) {
-    if (i != 0) {
-      metrics += ",\n";
-    }
-    metrics += JSON_FIELD(allVariables[i]->getLabel(), String(allVariables[i]->getLast()));
-  }
-  metrics += "\n}";
+      "\"id\":\"" + String(ESP.getChipId(), HEX)
+    + "\", \"mac\":\"" + WiFi.macAddress()
+    + "\", \"hostname\":\"" + String(hostname)
+    + "\", \"rco2\":\"" + String(CO2.getLast())
+    + "\", \"pm01\":\"" + String(pm01.getLast())
+    + "\", \"pm02\":\"" + String(pm25.getLast())
+    + "\", \"pm10\":\"" + String(pm10.getLast())
+    + "\", \"pm003_count\":\"" + String(pm03.getLast())
+    + "\", \"tvoc_index\":\"" + String(TVOC.getLast())
+    + "\", \"nox_index\":\"" + String(NOX.getLast())
+    + "\", \"atmp\":\"" + String(K_TO_C(temp.getLast()))
+    + "\", \"rhum\":\"" + String(hum.getLast())
+  + "\"\n}";
   wifiManager.server->send(200, "application/json", metrics);
 }
 
@@ -442,8 +477,26 @@ void setupWifi() {
   wifiManager.autoConnect((const char*)hostname);
 }
 
+void conditionTVOC() {
+  uint16_t srawVoc = 0;
+  uint16_t temp_celsius = static_cast<uint16_t>(std::round(K_TO_C(temp.getLast())));
+  uint16_t compensationT = static_cast<uint16_t>((temp_celsius + 45) * 65535. / 175.);
+  uint16_t compensationRh = static_cast<uint16_t>(hum.getLast() * 65535. / 100.);
+
+  uint16_t error = sgp41.executeConditioning(
+    compensationRh, 
+    compensationT, 
+    srawVoc
+  );
+
+  if (error) {
+    char error_message[256];
+    errorToString(error, error_message, 256);
+    Serial.println("Error from TVOC: " + String(error_message));
+  }
+}
+
 void updateTVOC() {
-  uint16_t error;
   uint16_t srawVoc = 0;
   uint16_t srawNox = 0;
 
@@ -451,21 +504,12 @@ void updateTVOC() {
   uint16_t compensationT = static_cast<uint16_t>((temp_celsius + 45) * 65535. / 175.);
   uint16_t compensationRh = static_cast<uint16_t>(hum.getLast() * 65535. / 100.);
 
-  if (conditioning_runs > 0) {
-    error = sgp41.executeConditioning(
-      compensationRh, 
-      compensationT, 
-      srawVoc
-    );
-    conditioning_runs--;
-  } else {
-    error = sgp41.measureRawSignals(
-      compensationRh, 
-      compensationT, 
-      srawVoc,
-      srawNox
-    );
-  }
+  uint16_t error = sgp41.measureRawSignals(
+    compensationRh, 
+    compensationT, 
+    srawVoc,
+    srawNox
+  );
 
   if (error) {
     char error_message[256];
@@ -506,11 +550,11 @@ void updateTempHum() {
       (sht.getTemperature() + 273.15) * 100
     ));
     temp.update(kelvin, currentInterval % sparkInterval == 0);
-    Serial.println("TEMP: " + String(kelvin / 100));
     hum.update(
       static_cast<uint16_t>(sht.getHumidity()),
       currentInterval % sparkInterval == 0
     );
+    Serial.println("TEMP: " + String(K_TO_C(temp.getLast())) + " HUM: " + String(hum.getLast()));
   } else {
     Serial.println("Error in readSample()");
   }
@@ -550,7 +594,16 @@ void renderSparkCaption() {
 
 void renderWifi() {
   u8g2.setFont(u8g2_font_siji_t_6x10);
-  if (WiFi.status() != WL_CONNECTED) {
+  if (WiFi.status() != WL_CONNECTED && wifiManager.getConfigPortalActive()) {
+    u8g2.drawGlyph(0, 64, 0xe21a);
+
+    u8g2.setFont(u8g2_font_t0_11_tf);
+    if (displaySSID) {
+      u8g2.drawStr(12, 64, wifiManager.getWiFiSSID().substring(0, 19).c_str());
+    } else {
+      u8g2.drawStr(12, 64, "HOTSPOT ACTIVE");
+    }
+  } else if (WiFi.status() != WL_CONNECTED) {
     u8g2.drawGlyph(0, 64, 0xe217);
 
     u8g2.setFont(u8g2_font_t0_11_tf);
@@ -589,41 +642,6 @@ void renderText(String ln1, String ln2, String ln3) {
   } while (u8g2.nextPage());
 }
 
-void sendToServer() {
-  if (!useAGPlatform) { 
-    return;
-  }
-
-  String payload = "{\"wifi\":" + String(WiFi.RSSI())
-                    + ", \"rco2\":" + String(CO2.getLast())
-                    + ", \"pm01\":" + String(pm01.getLast())
-                    + ", \"pm02\":" + String(pm25.getLast())
-                    + ", \"pm10\":" + String(pm10.getLast())
-                    + ", \"pm003_count\":" + String(pm03.getLast())
-                    + ", \"tvoc_index\":" + String(TVOC.getLast())
-                    + ", \"nox_index\":" + String(NOX.getLast())
-                    + ", \"atmp\":" + String(K_TO_C(temp.getLast()))
-                    + ", \"rhum\":" + String(hum.getLast())
-                    + "}";
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println(payload);
-    String POSTURL = APIROOT + "sensors/airgradient:" + String(ESP.getChipId(), HEX) + "/measures";
-    Serial.println(POSTURL);
-    WiFiClient client;
-    HTTPClient http;
-    http.begin(client, POSTURL);
-    http.addHeader("content-type", "application/json");
-    int httpCode = http.POST(payload);
-    String response = http.getString();
-    Serial.println(httpCode);
-    Serial.println(response);
-    http.end();
-  } else {
-    Serial.println("WiFi Disconnected");
-  }
-}
-
 void setup() {
   Serial.begin(115200);
   Serial.println("Hello");
@@ -640,11 +658,9 @@ void setup() {
   sht.setAccuracy(SHTSensor::SHT_ACCURACY_MEDIUM);
   sgp41.begin(Wire);
 
-  SoftwareSerial pmSerial(D5, D6);
   pmSerial.begin(9600);
   pm.init(pmSerial);
 
-  SoftwareSerial coSerial(D4, D3);
   coSerial.begin(9600);
   co.init(coSerial);
 }
@@ -653,7 +669,7 @@ void loop() {
   static esp8266::polledTimeout::oneShot warmUp(10000);
   static esp8266::polledTimeout::periodicMs fivSecond(5000);
   static esp8266::polledTimeout::periodicMs tenSecond(10000);
-
+  
   if (fivSecond && warmUp) {
     updateTVOC();
     updateTempHum();
@@ -662,6 +678,8 @@ void loop() {
 
     currentInterval = (currentInterval + 1) % (sparkInterval + 1);
     displayVariable = (displayVariable + 1) % (sizeof(allVariables) / sizeof(allVariables[0]));
+  } else if (fivSecond) {
+    conditionTVOC();
   }
   if (tenSecond) {
     sendToServer();

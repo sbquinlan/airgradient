@@ -209,31 +209,30 @@ void postToServer()
   if (!useAGPlatform) {
     return;
   }
-  String payload = "{\"wifi\":" + String(WiFi.RSSI()) + \
-    ", \"pm01\":" + String(pm1Mean) + \
-    ", \"pm02\":" + String(pm25Mean) + \
-    ", \"pm10\":" + String(pm10Mean) + \
-    ", \"pm003_count\":" + String(pm03Mean) + \
-    ", \"atmp\":" + String(pmTempMean / 100) + \
-    ", \"rhum\":" + String(pmHumMean / 100) + \
-    ", \"boot\":" + loopCount + ", \"channels\": {} }";
+  String payload = "{\"wifi\":\"" + String(WiFi.RSSI()) + \
+    "\", \"pm01\":\"" + String(pm1Mean) + \
+    "\", \"pm02\":\"" + String(pm25Mean) + \
+    "\", \"pm10\":\"" + String(pm10Mean) + \
+    "\", \"pm003_count\":\"" + String(pm03Mean) + \
+    "\", \"atmp\":\"" + String(pmTempMean / 10) + \
+    "\", \"rhum\": \"" + String(pmHumMean / 10) + \
+    "\", \"boot\":\"" + loopCount + "\", \"channels\": {} }";
   loopCount++;
   sendPayload(payload);
 }
 
-#define JSON_FIELD(name, value) "\"" + name + "\": \"" + value + "\",\n"
 void wifi_handleMetrics() {
   // Use json-exporter if you want to ingest this to prometheus. Not worth being 
   // prometheus-specific at this point.
   String metrics = "{\n"
-    JSON_FIELD(String("mac"), WiFi.macAddress())
-    JSON_FIELD(String("hostname"), String(hostname))
-    JSON_FIELD("pm01", String(pm1Mean))
-    JSON_FIELD("pm02", String(pm25Mean))
-    JSON_FIELD("pm10", String(pm10Mean))
-    JSON_FIELD("pm003_count", String(pm03Mean))
-    JSON_FIELD("atmp", String(pmTempMean / 100))
-    "\"rhum\": \"" + String(pmHumMean / 100) + "\"\n"
+    "\"mac\":\"" + WiFi.macAddress() + \
+    "\", \"hostname\":\"" + String(hostname) + \
+    "\", \"pm01\":\"" + String(pm1Mean) + \
+    "\", \"pm02\":\"" + String(pm25Mean) + \
+    "\", \"pm10\":\"" + String(pm10Mean) + \
+    "\", \"pm003_count\":\"" + String(pm03Mean) + \
+    "\", \"atmp\":\"" + String(pmTempMean / 10) + \
+    "\", \"rhum\": \"" + String(pmHumMean / 10) + "\"\n"
   "}";
   wifiManager.server->send(200, "application/json", metrics);
 }
