@@ -24,9 +24,11 @@ MIT License
 
 */
 
-
+#include <Sht/Sht.h>
+#include <S8/S8.h>
+#include <PMS/PMS.h>
+#include <PMS/PMS5003.h>
 #include <Arduino.h>
-#include <AirGradient.h>
 #include <EEPROM.h>
 #include <ESP8266HTTPClient.h>
 #include <ESP8266WebServer.h>
@@ -35,27 +37,20 @@ MIT License
 #include <WiFiClient.h>
 #include <WiFiManager.h>
 
-#include "SHTSensor.h"
-
-#include <SparkLine.h>
 #include <U8g2lib.h>
 
-PMS pm;
-CO2Sensor co;
-SHTSensor sht;
+Sht sht(BoardType::DIY_BASIC);
+S8 co2(BoardType::DIY_BASIC);
+PMS5003 pms(BoardType::DIY_BASIC);
 
 // Display bottom right
-U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/U8X8_PIN_NONE);
-
-// Replace above if you have display on top left
-//U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R2, /* reset=*/ U8X8_PIN_NONE);
+U8G2_SSD1306_64X48_ER_1_HW_I2C u8g2(U8G2_R0, /* reset=*/U8X8_PIN_NONE);
 
 // CONFIGURATION START
 // for persistent saving and loading
 const uint8_t settings_addr = 4;
 const uint8_t hostname_addr = 8;
 const uint8_t hostname_len = 24;
-const uint8_t sparkInterval_addr = 32;
 
 //set to the endpoint you would like to use
 boolean useAGPlatform = false;
@@ -66,9 +61,6 @@ boolean useFahrenheit = true;
 
 // PM2.5 in US AQI (default ug/m3)
 boolean useUSAQI = true;
-
-// interval to record measurements to spark
-uint16_t sparkInterval = 1;
 
 char hostname[24];
 
@@ -97,7 +89,6 @@ const std::function<float(const uint16_t x)> PM_TO_AQI_US = [](const uint16_t pm
 class AirVariable 
 {
   using UnitConversionFunction = std::function<float(const uint16_t x)>;
-  SparkLine<uint16_t> spark;
   uint16_t last = 0;
   String label;
   String units;
@@ -114,11 +105,8 @@ class AirVariable
     }
   
   public:
-    void update(uint16_t measurement, boolean recordToSpark) {
+    void update(uint16_t measurement) {
       last = measurement;
-      if (recordToSpark) {
-        spark.add(measurement);
-      }
     }
 
     String getLabel() const {
@@ -147,18 +135,6 @@ class AirVariable
       u8g2.setFont(u8g2_font_t0_11_tf);
       u8g2.drawStr(0, 11, label.c_str());
       u8g2.drawStr(width, 31, units.c_str());
-
-      formatNumber(number_buffer, 6, conversion(spark.findMax()));
-      u8g2.drawStr(98, 24, number_buffer);
-
-      formatNumber(number_buffer, 6, conversion(spark.findMin()));
-      u8g2.drawStr(98, 36, number_buffer);
-
-      u8g2.setFont(u8g2_font_siji_t_6x10);
-      u8g2.drawGlyph(86, 24, 0xe12b);
-      u8g2.drawGlyph(86, 36, 0xe12c);
-
-      spark.draw(0, 50, 76, 16);
     }
 
     AirVariable(
@@ -166,10 +142,7 @@ class AirVariable
       const char* _units,
       UnitConversionFunction converter = identity
     )
-      : spark(60, [&](const uint16_t x0, const uint16_t y0, const uint16_t x1, const uint16_t y1) { 
-          u8g2.drawLine(x0, y0, x1, y1);
-        }),
-        label(_label),
+      : label(_label),
         units(_units),
         conversion(converter)
     {}  
@@ -295,21 +268,6 @@ CustomParameter wifi_spark_interval(
   "</select>"
 );
 
-void validateSparkInterval() {
-  switch (sparkInterval) {
-    case 1:
-    case 2:
-    case 6:
-    case 12:
-    case 72:
-    case 144:
-    case 288:
-      return;
-    default:
-      sparkInterval = 1;
-  }
-}
-
 void readSettings() {
   uint8_t settings = EEPROM.read(settings_addr);
   useAGPlatform = (settings & 1) == 1;
@@ -325,15 +283,9 @@ void readSettings() {
   pm25.setConversion(useUSAQI ? PM_TO_AQI_US : identity);
   pm25.setUnits(useUSAQI ? "AQI" : "\xB5g/m\xB3");
   wifiManager.setHostname(hostname);
-
-  sparkInterval = EEPROM.read(sparkInterval_addr);
-
-  validateSparkInterval();
 }
 
 void writeSettings() {
-  validateSparkInterval();
-
   uint8_t settings = 0;
   if (useAGPlatform) {
     settings |= 1;
@@ -350,7 +302,6 @@ void writeSettings() {
     EEPROM.write(hostname_addr + i, hostname[i]);
   }
 
-  EEPROM.write(sparkInterval_addr, sparkInterval);
   EEPROM.commit();
 
   temp.setConversion(useFahrenheit ? K_TO_F : K_TO_C);
@@ -376,17 +327,13 @@ void sendToServer() {
   + "\"\n}";
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println(payload);
     String POSTURL = APIROOT + "sensors/airgradient:" + String(ESP.getChipId(), HEX) + "/measures";
-    Serial.println(POSTURL);
     WiFiClient client;
     HTTPClient http;
     http.begin(client, POSTURL);
     http.addHeader("content-type", "application/json");
     int httpCode = http.POST(payload);
     String response = http.getString();
-    Serial.println(httpCode);
-    Serial.println(response);
     http.end();
   } else {
     Serial.println("WiFi Disconnected");
@@ -412,7 +359,7 @@ void wifi_handleMetrics() {
 }
 
 void wifi_addRoutes() {
-  Serial.println("Adding metrics route");
+  Serial.println("*wm:Adding metrics route");
   wifiManager.server->on("/metrics", wifi_handleMetrics);
 }
 
@@ -428,9 +375,6 @@ void wifi_saveParameters() {
   useAGPlatform = ag_platform_yes.equals(wifi_ag_platform.getValue());
   useFahrenheit = temp_units_fahrenheit.equals(wifi_temp_units.getValue());
   useUSAQI = pm_units_usaqi.equals(wifi_pm_units.getValue());
-  sparkInterval = String(wifi_spark_interval.getValue()).toInt();
-
-  validateSparkInterval();
   writeSettings();
 }
 
@@ -458,100 +402,75 @@ void setupWifi() {
 }
 
 void updateCo2() {
-  CO2.update(co.getCO2_Raw(), currentInterval % sparkInterval == 0);
-  Serial.println("\nCO2: " + String(CO2.getLast()));
+  int value = co2.getCo2();
+  if (value < 0) {
+    Serial.println("CO2 read failed");
+  } else {
+    CO2.update(value);
+  }
 }
 
 void updatePm() {
-  pm.requestRead();
-  if (!pm.readUntil(2000)) {
-    Serial.println("PM read failed");
-    return;
-  }
+  if (pms.isFailed() == false) {
+    pm01.update(pms.getPm01Ae());
+    pm25.update(pms.getPm25Ae());
+    pm10.update(pms.getPm10Ae());
+    pm03.update(pms.getPm03ParticleCount());
 
-  const PMS::Data& pm_data = pm.getData();
-  pm01.update(pm_data.PM_AE_UG_1_0, currentInterval % sparkInterval == 0);
-  pm25.update(pm_data.PM_AE_UG_2_5, currentInterval % sparkInterval == 0);
-  pm10.update(pm_data.PM_AE_UG_10_0, currentInterval % sparkInterval == 0);
-  pm03.update(pm_data.PM_RAW_0_3, currentInterval % sparkInterval == 0);
-  Serial.println("PM25: " + String(pm25.getLast()));
+    Serial.printf(
+      "PM1 %d\r\nPM2.5 %d\r\nPM10 %d\r\nPM0.3 %d\r\n", 
+      pm01.getLast(), 
+      pm25.getLast(), 
+      pm10.getLast(), 
+      pm03.getLast()
+    );
+  } else {
+    Serial.printf("PMS read failed\r\n");
+  }
 }
 
 void updateTempHum() {
-  if (sht.readSample()) {
+  if (sht.measure()) {
     // temp is hundreths of a degree to avoid using floats
     uint16_t kelvin = static_cast<uint16_t>(std::round(
       (sht.getTemperature() + 273.15) * 100
     ));
-    temp.update(kelvin, currentInterval % sparkInterval == 0);
-    Serial.println("TEMP: " + String(kelvin / 100));
+    temp.update(kelvin);
+    Serial.printf("Temp %d\r\nHum %d\r\n", kelvin / 100, sht.getRelativeHumidity());
     hum.update(
-      static_cast<uint16_t>(sht.getHumidity()),
-      currentInterval % sparkInterval == 0
+      static_cast<uint16_t>(sht.getRelativeHumidity())
     );
   } else {
-    Serial.println("Error in readSample()");
+    Serial.printf("Error in updateTempHum()\r\n");
   }
-}
-
-void renderSparkCaption() {
-  String sparkCaption;
-  switch (sparkInterval) {
-    case 1:
-      sparkCaption = "last 5m";
-      break;
-    case 2: 
-      sparkCaption = "last 10m";
-      break;
-    case 6:
-      sparkCaption = "last 30m";
-      break;
-    case 12:
-      sparkCaption = "last 1h";
-      break;
-    case 72:
-      sparkCaption = "last 6h";
-      break;
-    case 144:
-      sparkCaption = "last 12h";
-      break;
-    case 288:
-      sparkCaption = "last 1d";
-      break;
-    default:
-      sparkInterval = 1;
-      sparkCaption = "last 5m";
-  }
-  u8g2.setFont(u8g2_font_t0_11_tf);
-  u8g2.drawStr(79, 50, sparkCaption.c_str());
 }
 
 void renderWifi() {
   u8g2.setFont(u8g2_font_siji_t_6x10);
   if (WiFi.status() != WL_CONNECTED && wifiManager.getConfigPortalActive()) {
-    u8g2.drawGlyph(0, 64, 0xe21a);
+    u8g2.drawGlyph(0, 48, 0xe21a);
 
     u8g2.setFont(u8g2_font_t0_11_tf);
     if (displaySSID) {
-      u8g2.drawStr(12, 64, wifiManager.getWiFiSSID().substring(0, 19).c_str());
+      u8g2.drawStr(12, 48, wifiManager.getWiFiSSID().substring(0, 19).c_str());
     } else {
-      u8g2.drawStr(12, 64, "HOTSPOT ACTIVE");
+      u8g2.drawStr(12, 48, "HOTSPOT");
     }
   } else if (WiFi.status() != WL_CONNECTED) {
-    u8g2.drawGlyph(0, 64, 0xe217);
+    u8g2.drawGlyph(0, 48, 0xe217);
 
     u8g2.setFont(u8g2_font_t0_11_tf);
-    u8g2.drawStr(12, 64, "DISCONNECTED");
+    u8g2.drawStr(12, 48, "OFFLINE");
   } else {
-    u8g2.drawGlyph(0, 64, 0xe21a);
+    u8g2.drawGlyph(0, 48, 0xe21a);
 
     u8g2.setFont(u8g2_font_t0_11_tf);
     if (displaySSID) {
-      u8g2.drawStr(12, 64, wifiManager.getWiFiSSID().substring(0, 19).c_str());
+      u8g2.drawStr(12, 48, wifiManager.getWiFiSSID().substring(0, 19).c_str());
     } else {
-      char sliced[20];
-      strncpy(sliced, hostname, 19);
-      u8g2.drawStr(12, 64, sliced);
+      char sliced[9] = { "\0" };
+      strncpy(sliced, hostname, 8);
+      u8g2.drawStr(12, 48, sliced);
     }
   }
 }
@@ -562,7 +481,6 @@ void renderVariable() {
   do {
     variable->draw();
     renderWifi();
-    renderSparkCaption();
   } while (u8g2.nextPage());
 }
 
@@ -571,33 +489,38 @@ void renderText(String ln1, String ln2, String ln3) {
   do {
     u8g2.setFont(u8g2_font_t0_16_tf);
     u8g2.drawStr(1, 10, String(ln1).c_str());
-    u8g2.drawStr(1, 30, String(ln2).c_str());
-    u8g2.drawStr(1, 50, String(ln3).c_str());
+    u8g2.drawStr(1, 28, String(ln2).c_str());
+    u8g2.drawStr(1, 48, String(ln3).c_str());
   } while (u8g2.nextPage());
 }
 
 void setup() {
   Serial.begin(115200);
+  delay(100);
+
   Serial.println("Hello");
-  u8g2.begin();
 
   EEPROM.begin(512);
 
   pinMode(D7, INPUT_PULLUP);
+  Wire.begin(SDA, SCL);
+  Wire.setClock(100000);
+  delay(1000);
+
+  Serial.println("Setting up display");
+  u8g2.setBusClock(100000);
+  u8g2.begin();
+  delay(1000);
 
   readSettings();
   setupWifi();
 
-  sht.init();
-  sht.setAccuracy(SHTSensor::SHT_ACCURACY_MEDIUM);
+  // 0x40 is the default I2C address for the SHT4x
+  Serial.println("Setting up SHT");
+  sht.begin(Wire, Serial);
 
-  SoftwareSerial pmSerial(D5, D6);
-  pmSerial.begin(9600);
-  pm.init(pmSerial);
-
-  SoftwareSerial coSerial(D4, D3);
-  coSerial.begin(9600);
-  co.init(coSerial);
+  co2.begin(&Serial);
+  pms.begin(&Serial);
 }
 
 void loop() {
@@ -610,7 +533,6 @@ void loop() {
     updateCo2();
     updatePm();
 
-    currentInterval = (currentInterval + 1) % (sparkInterval + 1);
     displayVariable = (displayVariable + 1) % (sizeof(allVariables) / sizeof(allVariables[0]));
   }
   if (tenSecond) {
@@ -643,7 +565,6 @@ void loop() {
         useAGPlatform = false;
         useFahrenheit = true;
         useUSAQI = true;
-        sparkInterval = 1;
         strcpy(hostname, "");
         writeSettings();
         renderText("Resetting", "", "");
